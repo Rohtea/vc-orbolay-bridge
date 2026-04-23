@@ -6,7 +6,8 @@
 
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
-import { ChannelStore, FluxDispatcher, GenericStore, GuildMemberStore, Toasts, UserStore } from "@webpack/common";
+import * as Webpack from "@webpack";
+import { ChannelStore, FluxDispatcher, GenericStore, GuildMemberStore, Toasts, UserStore, SelectedChannelStore, React, Button } from "@webpack/common";
 import { waitForStore } from "@webpack/common/internal";
 
 export let VoiceStateStore: GenericStore;
@@ -39,7 +40,108 @@ interface Config {
     voiceSemitransparent: boolean;
     messagesSemitransparent: boolean;
     isKeybindEnabled: boolean;
+    notifyActiveChannel: boolean;
+    keybind: string;
 }
+
+const formatKey = (code: string) => {
+    return code
+    .replace(/Control(Left|Right)/, "Ctrl")
+    .replace(/Shift(Left|Right)/, "Shift")
+    .replace(/Alt(Left|Right)/, "Alt")
+    .replace(/Meta(Left|Right)/, "Super")
+    .replace("Backquote", "`")
+    .replace("Minus", "-")
+    .replace("Equal", "=")
+    .replace("BracketLeft", "[")
+    .replace("BracketRight", "]")
+    .replace("Backslash", "\\")
+    .replace("Semicolon", ";")
+    .replace("Quote", "'")
+    .replace("Comma", ",")
+    .replace("Period", ".")
+    .replace("Slash", "/")
+    .replace(/Key([A-Z])/, "$1")
+    .replace(/Digit([0-9])/, "$1");
+};
+
+const KeybindRecorder = () => {
+    const [keys, setKeys] = React.useState<string[]>(() =>
+    settings.store.keybind ? settings.store.keybind.split("+").filter(Boolean) : []
+    );
+    const [recording, setRecording] = React.useState(false);
+
+    React.useEffect(() => {
+        if (!recording) return;
+
+        const handleKeyDown = (e: KeyboardEvent) => {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const keyName = e.code;
+
+            setKeys(prev => {
+                if (!prev.includes(keyName)) {
+                    const newKeys = [...prev, keyName];
+                    settings.store.keybind = newKeys.join("+");
+                    return newKeys;
+                }
+                return prev;
+            });
+        };
+
+        const handleKeyUp = (e: KeyboardEvent) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setRecording(false);
+
+            // Sync with the Rust backend immediately so it works without restarting
+            if (ws?.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    cmd: "REGISTER_CONFIG",
+                    ...settings.store,
+                    userId: UserStore?.getCurrentUser()?.id
+                }));
+            }
+        };
+
+        window.addEventListener("keydown", handleKeyDown, true);
+        window.addEventListener("keyup", handleKeyUp, true);
+
+        return () => {
+            window.removeEventListener("keydown", handleKeyDown, true);
+            window.removeEventListener("keyup", handleKeyUp, true);
+        };
+    }, [recording]);
+
+    return (
+        <div style={{ display: "flex", alignItems: "center", gap: "10px", marginTop: "8px" }}>
+        <div style={{
+            flex: 1,
+            padding: "8px 12px",
+            background: "var(--input-background)", // Better contrast than background-secondary
+            border: recording ? "1px solid var(--brand-experiment)" : "1px solid var(--background-tertiary)",
+            borderRadius: "4px",
+            color: "var(--text-normal, #ffffff)",
+            fontWeight: 500
+        }}>
+        {keys.length > 0 ? keys.map(formatKey).join(" + ") : "None"}
+        </div>
+        <Button
+        size={Button.Sizes.TINY}
+        look={recording ? Button.Looks.OUTLINED : Button.Looks.FILLED}
+        color={recording ? Button.Colors.RED : Button.Colors.BRAND}
+        onClick={() => {
+            setKeys([]);
+            settings.store.keybind = "";
+            setRecording(true);
+        }}
+        >
+        {recording ? "Recording..." : "Record Keybind"}
+        </Button>
+        </div>
+    );
+};
 
 const settings = definePluginSettings({
     port: {
@@ -50,9 +152,25 @@ const settings = definePluginSettings({
     },
     isKeybindEnabled: {
         type: OptionType.BOOLEAN,
-        description: "Enable/disable the global keybind (Ctrl + `)",
+        description: "Enable/disable the global keybind",
         default: true,
-        restartNeeded: true,
+        restartNeeded: false,
+
+    },
+    keybind: {
+        type: OptionType.COMPONENT,
+        description: "Overlay toggle keybind",
+        default: "ControlLeft+Backquote",
+        component: KeybindRecorder,
+        onChange: (newValue) => {
+            // Send the update immediately when the value changes
+            if (ws?.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    cmd: "REGISTER_CONFIG",
+                    ...settings.store, // Send the whole store
+                }));
+            }
+        }
     },
     messageAlignment: {
         type: OptionType.SELECT,
@@ -98,6 +216,12 @@ const settings = definePluginSettings({
         default: false,
         restartNeeded: true
     },
+    notifyActiveChannel: {
+        type: OptionType.BOOLEAN,
+        description: "Show notifications for the channel you are currently looking at",
+        default: true,
+            restartNeeded: false
+    }
 });
 let ws: WebSocket | null = null;
 let currentChannel = null;
@@ -193,17 +317,58 @@ const handleSpeaking = dispatch => {
     );
 };
 
-const handleMessageNotification = dispatch => {
-    ws?.send(
+const handleMessageNotification = (dispatch: any) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    const selectedTextChannel = SelectedChannelStore.getChannelId();
+
+    if (dispatch.message?.channel_id === selectedTextChannel) {
+        return;
+    }
+
+    ws.send(
         JSON.stringify({
             cmd: "MESSAGE_NOTIFICATION",
             message: {
                 title: dispatch.title,
                 body: dispatch.body,
                 icon: dispatch.icon,
-                guildId: dispatch.message.guild_id,
-                channelId: dispatch.message.channel_id,
-                messageId: dispatch.message.id,
+                guildId: dispatch.message?.guild_id,
+                channelId: dispatch.message?.channel_id,
+                messageId: dispatch.message?.id,
+            }
+        })
+    );
+};
+
+const handleMessageCreate = (data: any) => {
+    if (!settings.store.notifyActiveChannel) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    const { message } = data;
+    const selectedTextChannel = SelectedChannelStore.getChannelId();
+
+    if (message.channel_id !== selectedTextChannel) return;
+
+    if (message.author.id === UserStore.getCurrentUser().id) return;
+
+    const member = message.member;
+
+    const displayName =
+    member?.nick ??
+    message.author.global_name ??
+    message.author.username;
+
+    ws.send(
+        JSON.stringify({
+            cmd: "MESSAGE_NOTIFICATION",
+            message: {
+                title: displayName,
+                body: message.content,
+                icon: `https://cdn.discordapp.com/avatars/${message.author.id}/${message.author.avatar}.png`,
+                guildId: message.guild_id,
+                channelId: message.channel_id,
+                messageId: message.id,
             }
         })
     );
@@ -369,6 +534,7 @@ export default definePlugin({
         VOICE_STATE_UPDATES: handleVoiceStateUpdates,
         RPC_NOTIFICATION_CREATE: handleMessageNotification,
         STREAMER_MODE: handleStreamerMode,
+        MESSAGE_CREATE: handleMessageCreate,
     },
 
     start() {
